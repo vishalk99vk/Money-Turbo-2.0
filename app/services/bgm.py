@@ -1,0 +1,416 @@
+import math
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import BinaryIO
+from uuid import uuid4
+
+from loguru import logger
+
+from app.utils import file_security, utils
+
+
+# Streamlit 默认允许较大的上传文件，但背景音乐通常只有几 MB。这里设置明确的
+# 服务端上限，避免 API 或 WebUI 把超大文件完整写入磁盘，影响同一进程中的视频任务。
+MAX_BGM_UPLOAD_BYTES = 30 * 1024 * 1024
+_COPY_CHUNK_BYTES = 1024 * 1024
+_INTERNAL_UPLOAD_PREFIX = ".bgm-upload-"
+_WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_FILENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)}
+    # Win32 把 Latin-1 上标数字 ¹、²、³ 也识别为设备编号，因此与普通数字保留名
+    # 同等处理，避免 COM¹.mp3 绕过保护。清单与 webui/Main.py 的下载文件名规则一致。
+    | {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in ("¹", "²", "³")}
+)
+# 文件名会原样进入日志、API 响应和 WebUI 界面，因此除路径分隔符与 Win32 保留名外，
+# 还要拒绝所有控制符和会改变显示形态的字符。此前只拦截 ord < 32（C0 控制符），
+# 漏掉了同一类问题的另一半：
+# * C1 控制符 U+007F-U+009F：U+0085 会被部分日志查看器渲染成换行，一个文件名就能
+#   伪造出额外的、看起来独立的日志行。
+# * 双向文本控制符 U+200E/U+200F/U+202A-U+202E/U+2066-U+2069：U+202E 之后的字符会被
+#   反向渲染，"photo\u202egnp.mp3" 在资源管理器和日志里看起来像另一个扩展名。
+# * U+2028/U+2029（Unicode 行/段分隔符）同样能在一行日志里制造视觉换行。
+# 这些字符都无法在文件名输入框里键入，正常上传不受影响；判定与
+# app/controllers/base.py 的 normalize_task_id 一致（那边直接用 isprintable）。
+_UNSAFE_FILENAME_CHARACTERS = frozenset(
+    chr(code)
+    for code in (
+        *range(0x00, 0x20),
+        *range(0x7F, 0xA0),
+        0x200E,
+        0x200F,
+        0x2028,
+        0x2029,
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+    )
+)
+# MoviePy 最终通过 FFmpeg 解码背景音乐，因此不需要人为限制为 MP3。这里仅开放
+# 主流且语义明确的音频扩展名，避免把 MP4 等带视频容器误当作背景音乐上传。
+# 元组同时作为 WebUI 上传控件的单一数据源，后续增删格式时不会出现前后端不一致。
+SUPPORTED_BGM_EXTENSIONS = (
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".wma",
+)
+
+
+class BgmUploadError(ValueError):
+    """表示上传文件不满足背景音乐的安全或格式要求。"""
+
+
+class BgmServiceError(RuntimeError):
+    """表示 FFmpeg 或文件系统不可用等服务端执行故障。"""
+
+
+def should_use_bgm(bgm_type: str | None, bgm_volume: float | None) -> bool:
+    """
+    统一判断当前任务是否需要处理任何背景音乐。
+
+    该规则与具体来源无关：没有选择来源、音量不合法或音量不大于 0 时，随机、
+    自定义、Sonilo 以及未来新增的提供商都必须跳过文件解析、外部生成和最终混音。
+    放在通用 BGM 服务中可以避免每增加一个提供商就复制一套 0 音量判断。
+    """
+    if not str(bgm_type or "").strip():
+        return False
+    try:
+        normalized_volume = float(bgm_volume or 0)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(normalized_volume) and normalized_volume > 0
+
+
+def uploaded_bgm_dir(create: bool = True) -> str:
+    """
+    返回用户背景音乐的持久化目录。
+
+    内置歌曲属于代码资源，继续放在 resource/songs；用户上传内容属于运行时数据，
+    必须放在 Docker 已挂载的 storage 下，容器重建后才能保留，也不会污染 Git 工作区。
+    """
+    return utils.storage_dir("bgm", create=create)
+
+
+def _remove_staged_file(file_path: str) -> None:
+    """尽力清理上传临时文件，且不覆盖调用方正在处理的原始异常。"""
+    if not file_path or not os.path.exists(file_path):
+        return
+    try:
+        os.remove(file_path)
+    except OSError as exc:
+        # 临时文件使用保留前缀，不会进入 BGM 列表；清理失败不应把“音频非法”
+        # 等更准确的原始异常覆盖掉，但必须留下路径和系统错误供运维定位。
+        logger.warning(
+            f"failed to remove staged background music: path={file_path}, "
+            f"error={str(exc)}"
+        )
+
+
+def sanitize_upload_filename(filename: str) -> str:
+    """提取可跨平台展示的音频文件名，并拒绝非法名称与不支持的扩展名。"""
+    safe_name = (filename or "").replace("\\", "/").split("/")[-1].strip()
+    if (
+        not safe_name
+        or safe_name in {".", ".."}
+        or len(safe_name) > 255
+        or any(character in _UNSAFE_FILENAME_CHARACTERS for character in safe_name)
+        or any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in safe_name)
+        or safe_name.lower().startswith(_INTERNAL_UPLOAD_PREFIX)
+    ):
+        raise BgmUploadError("invalid background music filename")
+
+    # Windows 会把扩展名前的首段识别为设备名，例如 CON.mp3、LPT1.wav 都
+    # 不能作为普通文件创建。即使服务端最终使用 UUID，提前拒绝这类名称也能
+    # 保证 API 在不同平台上的输入行为一致。
+    windows_basename = safe_name.split(".", 1)[0].rstrip(" .").upper()
+    if windows_basename in _WINDOWS_RESERVED_FILENAMES:
+        raise BgmUploadError("invalid background music filename")
+    if Path(safe_name).suffix.lower() not in SUPPORTED_BGM_EXTENSIONS:
+        supported_formats = ", ".join(
+            extension.removeprefix(".").upper()
+            for extension in SUPPORTED_BGM_EXTENSIONS
+        )
+        raise BgmUploadError(
+            f"unsupported background music format; supported formats: {supported_formats}"
+        )
+    return safe_name
+
+
+def _validate_audio(file_path: str, timeout_seconds: int = 30) -> None:
+    """
+    仅使用项目当前配置的 FFmpeg 验证文件包含可完整解码的音频流。
+
+    项目允许 imageio-ffmpeg 提供便携 FFmpeg，该安装方式不保证同时存在
+    FFprobe，因此不能新增独立二进制依赖。`-map 0:a:0` 会在没有音频流时失败，
+    `-xerror` 会把解码错误提升为失败；完整解码还能拦截加密文件或随机数据偶然
+    命中音频帧头的误判。文件可以包含专辑封面等附加流，但只校验第一条音频流。
+    """
+    try:
+        decoded = subprocess.run(
+            [
+                utils.get_ffmpeg_binary(),
+                "-nostdin",
+                "-v",
+                "error",
+                "-xerror",
+                # Uploaded files must be self-contained media, not playlists
+                # that cause validation/rendering to read adjacent files or URLs.
+                "-protocol_whitelist",
+                "file,pipe",
+                "-format_whitelist",
+                "mp3,mov,aac,wav,flac,ogg,asf",
+                "-i",
+                file_path,
+                "-map",
+                "0:a:0",
+                # Normalize timestamps from decoded samples. A header-only
+                # WAV can exit successfully without producing any audio.
+                "-af",
+                "asetpts=N/SR/TB",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BgmServiceError("FFmpeg background music validation timed out") from exc
+    except OSError as exc:
+        raise BgmServiceError("failed to run FFmpeg for background music validation") from exc
+    if decoded.returncode != 0:
+        raise BgmUploadError("uploaded file must contain a decodable audio stream")
+    decoded_audio = False
+    for line in decoded.stdout.splitlines():
+        key, separator, value = line.partition(b"=")
+        if separator and key == b"out_time_us":
+            try:
+                decoded_audio = decoded_audio or int(value) > 0
+            except ValueError:
+                continue
+    if not decoded_audio:
+        raise BgmUploadError("uploaded file must contain nonempty decodable audio")
+
+
+def validate_audio_file(file_path: str, timeout_seconds: int = 120) -> None:
+    """
+    校验磁盘上的音频文件可由项目 FFmpeg 完整解码。
+
+    上传预检通常只需 30 秒；Sonilo 生成的配乐最长可达 6 分钟，因此对外提供
+    可调整超时的复用入口。服务只依赖 FFmpeg，不要求系统额外安装 FFprobe。
+    """
+    if not os.path.isfile(file_path) or os.path.getsize(file_path) <= 0:
+        raise BgmUploadError("background music file is empty or missing")
+    _validate_audio(file_path, timeout_seconds=timeout_seconds)
+
+
+def _stage_bgm_upload(filename: str, source: BinaryIO) -> tuple[str, str, int]:
+    """
+    将上传流写入同目录临时文件，并返回安全文件名、临时路径和字节数。
+
+    WebUI 的上传预检和最终持久化必须使用完全相同的分块读取、大小限制与文件名
+    规则，否则可能出现界面显示可用、点击生成后却被服务端拒绝的状态分裂。
+    临时文件由调用方在完成音频探测后删除或原子替换。
+    """
+    safe_name = sanitize_upload_filename(filename)
+    try:
+        target_dir = uploaded_bgm_dir(create=True)
+    except OSError as exc:
+        raise BgmServiceError("failed to prepare background music storage") from exc
+    temp_path = ""
+    total_bytes = 0
+
+    try:
+        try:
+            source.seek(0)
+        except (AttributeError, OSError) as exc:
+            raise BgmUploadError("background music upload is not seekable") from exc
+
+        # 保留原始扩展名便于 FFmpeg 针对无容器头的 AAC 等格式选择正确的
+        # demuxer；临时文件仍放在目标目录，以保证最终 os.replace 是原子操作。
+        descriptor, temp_path = tempfile.mkstemp(
+            prefix=_INTERNAL_UPLOAD_PREFIX,
+            suffix=Path(safe_name).suffix.lower(),
+            dir=target_dir,
+        )
+        with os.fdopen(descriptor, "wb") as output:
+            while True:
+                chunk = source.read(_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise BgmUploadError("background music upload must be binary")
+                total_bytes += len(chunk)
+                if total_bytes > MAX_BGM_UPLOAD_BYTES:
+                    raise BgmUploadError("background music file exceeds the 30 MB limit")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+
+        if total_bytes == 0:
+            raise BgmUploadError("background music file is empty")
+        return safe_name, temp_path, total_bytes
+    except Exception as exc:
+        _remove_staged_file(temp_path)
+        if isinstance(exc, BgmUploadError):
+            raise
+        if isinstance(exc, OSError):
+            raise BgmServiceError("failed to stage background music upload") from exc
+        raise
+    finally:
+        # Streamlit 还需要使用同一个 UploadedFile 做浏览器试听；恢复文件指针可
+        # 避免校验后播放器或最终保存读取到空内容。
+        try:
+            source.seek(0)
+        except (AttributeError, OSError):
+            pass
+
+
+def validate_bgm_upload(filename: str, source: BinaryIO) -> str:
+    """完整校验上传音频但不持久化，用于 WebUI 在显示“已就绪”前预检。"""
+    safe_name, temp_path, total_bytes = _stage_bgm_upload(filename, source)
+    try:
+        _validate_audio(temp_path)
+        logger.debug(
+            f"background music upload validated: name={safe_name}, "
+            f"size={total_bytes} bytes"
+        )
+        return safe_name
+    finally:
+        _remove_staged_file(temp_path)
+
+
+def save_bgm_upload(filename: str, source: BinaryIO) -> str:
+    """
+    以分块、限量和原子替换的方式保存用户背景音乐。
+
+    使用场景包括 FastAPI UploadFile 和 Streamlit UploadedFile，两者都提供二进制
+    文件接口。先写同目录临时文件并验证，再通过 os.replace 原子落盘，既能避免
+    并发上传或进程中断留下半个音频文件，也会让同名上传获得不同的 UUID 存储键，
+    已排队或运行中的任务因此始终引用原来的不可变文件。
+    """
+    safe_name, temp_path, total_bytes = _stage_bgm_upload(filename, source)
+    stored_name = f"{uuid4().hex}{Path(safe_name).suffix.lower()}"
+    target_path = os.path.join(os.path.dirname(temp_path), stored_name)
+
+    try:
+        _validate_audio(temp_path)
+        try:
+            os.replace(temp_path, target_path)
+        except OSError as exc:
+            raise BgmServiceError("failed to persist background music upload") from exc
+        temp_path = ""
+        logger.info(
+            f"background music uploaded: original_name={safe_name}, "
+            f"stored_name={stored_name}, size={total_bytes} bytes"
+        )
+        return stored_name
+    finally:
+        _remove_staged_file(temp_path)
+
+
+def _list_bgm_files(directories: tuple[str, ...]) -> list[str]:
+    """按目录优先级枚举安全且受支持的背景音乐文件。"""
+    files_by_name: dict[str, str] = {}
+    for directory in directories:
+        if not os.path.isdir(directory):
+            continue
+        for name in sorted(os.listdir(directory), key=str.lower):
+            # 上传预检和最终保存都会短暂创建同目录文件。临时文件虽然带有合法
+            # 音频扩展名，但尚未完成校验，不能被随机 BGM 列表提前选中。
+            if name.startswith(_INTERNAL_UPLOAD_PREFIX):
+                continue
+            if Path(name).suffix.lower() not in SUPPORTED_BGM_EXTENSIONS:
+                continue
+            file_path = os.path.join(directory, name)
+            try:
+                # 枚举结果同样需要真实路径校验。否则攻击者可在允许目录中放置
+                # 指向外部文件的音频符号链接，再借随机 BGM 路径交给 MoviePy。
+                resolved_path = file_security.resolve_path_within_directory(
+                    directory, file_path
+                )
+            except ValueError as exc:
+                logger.warning(
+                    f"skip unsafe background music file: name={name}, error={str(exc)}"
+                )
+                continue
+            files_by_name[name] = resolved_path
+    return [files_by_name[name] for name in sorted(files_by_name, key=str.lower)]
+
+
+def list_builtin_bgm_files() -> list[str]:
+    """
+    列出随项目分发的内置背景音乐。
+
+    WebUI 的“预设歌曲”和设置预设导入导出只使用这一列表，确保保存的文件名
+    可以在另一台使用相同版本的设备上恢复；用户上传文件仍由自定义音乐管理。
+    """
+    return _list_bgm_files((utils.song_dir(),))
+
+
+def list_bgm_files() -> list[str]:
+    """列出用户上传和内置的可用背景音乐，重名时优先使用上传文件。"""
+    return _list_bgm_files((utils.song_dir(), uploaded_bgm_dir(create=True)))
+
+
+def resolve_builtin_bgm_file(unsafe_path: str) -> str:
+    """按文件名解析内置背景音乐，并拒绝路径、未知文件和用户上传文件。"""
+    if not unsafe_path:
+        raise ValueError("background music filename is required")
+
+    filename = str(unsafe_path)
+    if filename != os.path.basename(filename):
+        raise ValueError("preset background music must use a filename")
+
+    files_by_name = {
+        os.path.basename(file_path): file_path for file_path in list_builtin_bgm_files()
+    }
+    if filename not in files_by_name:
+        raise ValueError("preset background music is not available")
+    return files_by_name[filename]
+
+
+def resolve_bgm_file(unsafe_path: str) -> str:
+    """
+    在用户上传目录和内置歌曲目录中解析 BGM，并拒绝两个白名单之外的路径与上传
+    中断遗留的暂存文件。
+
+    文件名优先命中用户目录，同时保留 `output000.mp3`、绝对白名单路径和
+    `./resource/songs/output000.mp3` 等旧用法。新上传文件使用 UUID，正常情况下
+    不会与内置歌曲或历史上传发生重名。
+    """
+    if (
+        not unsafe_path
+        or Path(unsafe_path).suffix.lower() not in SUPPORTED_BGM_EXTENSIONS
+    ):
+        raise ValueError("unsupported background music path")
+    if os.path.basename(str(unsafe_path)).lower().startswith(_INTERNAL_UPLOAD_PREFIX):
+        # 上传预检与最终保存都会在同一个目录里短暂创建 ``.bgm-upload-`` 前缀的
+        # 中间文件。它们带有合法的音频扩展名，但尚未完成校验，``_list_bgm_files``
+        # 已经把它们排除在随机 BGM 之外；解析入口必须给出同一个结论，否则
+        # API/CLI 传入的名称可以命中一个写入中断、内容不完整的中间文件。
+        # 用户传入的名称按不区分大小写比较，与 Windows/macOS 的文件系统一致。
+        raise ValueError("background music upload staging files are not selectable")
+
+    candidates = [unsafe_path]
+    if not os.path.isabs(unsafe_path):
+        candidates.append(os.path.join(utils.root_dir(), unsafe_path))
+
+    last_error = ValueError("background music file does not exist")
+    for directory in (uploaded_bgm_dir(create=True), utils.song_dir()):
+        for candidate in candidates:
+            try:
+                return file_security.resolve_path_within_directory(directory, candidate)
+            except ValueError as exc:
+                last_error = exc
+    raise ValueError(str(last_error)) from last_error

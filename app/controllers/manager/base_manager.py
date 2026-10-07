@@ -1,0 +1,146 @@
+import math
+import threading
+from typing import Any, Callable, Dict
+
+from loguru import logger
+
+
+class TaskQueueFullError(ValueError):
+    pass
+
+
+def _coerce_task_limit(value: Any, name: str) -> int:
+    """
+    把配置里的并发 / 排队上限解析成整数。
+
+    TOML 的数值既可能写成 `max_concurrent_tasks = 5`，也可能被写成 `"5"`。字符串
+    会一路传到 `add_task` 的比较运算里，变成不指出配置键名的 TypeError，而且
+    `max_queued_tasks` 写错时只在并发名额用尽后才触发。`app/services/webui_task.py`
+    对同一个 `max_queued_tasks` 键已经做了同样的收敛，这里把它提到唯一的构造入口。
+
+    解析不出整数的写法一律报出配置键名：`0.5` 会被 `int()` 静默截断成 0（任务只入队、
+    没有 worker 执行），TOML 允许的 `inf` / `-inf` / `nan` 也不是有效上限。
+    0 与负数保持原样：前者表示暂时不执行任务，后者让请求直接进入排队分支。
+    """
+    if isinstance(value, bool):
+        # bool 是 int 的子类，但 `true` 显然不是用户想要的上限。
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if isinstance(value, float):
+        # 非有限值不是上限，小数则会在截断后退化成「0：只排队不执行」的语义。
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite integer, got {value!r}")
+        if not value.is_integer():
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+
+
+class TaskManager:
+    def __init__(self, max_concurrent_tasks: int, max_queued_tasks: int = 100):
+        self.max_concurrent_tasks = _coerce_task_limit(
+            max_concurrent_tasks, "max_concurrent_tasks"
+        )
+        self.max_queued_tasks = _coerce_task_limit(max_queued_tasks, "max_queued_tasks")
+        self.current_tasks = 0
+        self.lock = threading.Lock()
+        self.queue = self.create_queue()
+
+    def create_queue(self):
+        raise NotImplementedError()
+
+    def add_task(self, func: Callable, *args: Any, **kwargs: Any):
+        with self.lock:
+            if self.current_tasks < self.max_concurrent_tasks:
+                logger.info(
+                    f"add task: {func.__name__}, current_tasks: {self.current_tasks}"
+                )
+                # 在线程启动前先预占并发名额。原实现在线程内部递增，连续请求
+                # 可能都在子线程获得锁之前看到 current_tasks=0，从而突破并发
+                # 上限。启动失败时回滚名额，让后续请求仍可正常调度。
+                self.current_tasks += 1
+                try:
+                    self.execute_task(func, *args, **kwargs)
+                except Exception:
+                    self.current_tasks -= 1
+                    raise
+            else:
+                queue_size = self.queue_size()
+                # 并发数已满时才进入排队。队列必须有上限，否则匿名接口可以持续
+                # 堆积任务对象和请求参数，最终造成内存耗尽或第三方 API 成本失控。
+                if queue_size >= self.max_queued_tasks:
+                    logger.warning(
+                        f"reject task: {func.__name__}, queue_size: {queue_size}, "
+                        f"max_queued_tasks: {self.max_queued_tasks}"
+                    )
+                    raise TaskQueueFullError("task queue is full, please try again later")
+
+                logger.info(
+                    f"enqueue task: {func.__name__}, current_tasks: {self.current_tasks}, "
+                    f"queue_size: {queue_size}"
+                )
+                self.enqueue_new_task({"func": func, "args": args, "kwargs": kwargs})
+
+    def execute_task(self, func: Callable, *args: Any, **kwargs: Any):
+        thread = threading.Thread(
+            target=self.run_task, args=(func, *args), kwargs=kwargs
+        )
+        thread.start()
+
+    def run_task(self, func: Callable, *args: Any, **kwargs: Any):
+        try:
+            func(*args, **kwargs)  # call the function here, passing *args and **kwargs.
+        finally:
+            self.task_done()
+
+    def check_queue(self):
+        with self.lock:
+            self._check_queue_locked()
+
+    def _check_queue_locked(self):
+        """Dispatch one queued task while the caller holds ``self.lock``."""
+        if (
+            self.current_tasks < self.max_concurrent_tasks
+            and not self.is_queue_empty()
+        ):
+            task_info = self.dequeue()
+            if task_info is None:
+                # dequeue() may skip and discard queue entries that no longer
+                # pass current validation (see RedisTaskManager.dequeue) and
+                # return None once nothing usable is left, even though
+                # is_queue_empty() was False a moment earlier.
+                return
+            func = task_info["func"]
+            args = task_info.get("args", ())
+            kwargs = task_info.get("kwargs", {})
+            # Reserve the freed slot before another add_task can claim it.
+            self.current_tasks += 1
+            try:
+                self.execute_task(func, *args, **kwargs)
+            except Exception:
+                self.current_tasks -= 1
+                self.enqueue(task_info)
+                raise
+
+    def task_done(self):
+        with self.lock:
+            self.current_tasks -= 1
+            self._check_queue_locked()
+
+    def enqueue(self, task: Dict):
+        raise NotImplementedError()
+
+    def enqueue_new_task(self, task: Dict):
+        """Admit new work; shared queues may need their own atomic limit check."""
+        self.enqueue(task)
+
+    def dequeue(self):
+        raise NotImplementedError()
+
+    def is_queue_empty(self):
+        raise NotImplementedError()
+
+    def queue_size(self):
+        raise NotImplementedError()
